@@ -81,16 +81,17 @@ class RenderParameters(object):
 
 
 class PathLine(object):
-	def __init__(self, start, end, on=True):
+	def __init__(self, start, end, on=True, color=(255, 255, 255)):
 		self.start = start
 		self.end = end
 		self.on = on
+		self.color = color
 	def copy(self):
-		return PathLine(self.start, self.end)
+		return PathLine(self.start, self.end, color=self.color)
 	def transform(self, func):
 		self.start = func(self.start)
 		self.end = func(self.end)
-	def render(self, params):
+	def render(self, params, color):
 		dx = self.end[0] - self.start[0]
 		dy = self.end[1] - self.start[1]
 		length = math.sqrt(dx**2 + dy**2)
@@ -104,14 +105,14 @@ class PathLine(object):
 		for i in range(1, steps+1):
 			x = self.start[0] + i * dx
 			y = self.start[1] + i * dy
-			out.append(LaserSample((int(x*params.width),int(y*params.height)), self.on))
+			out.append(LaserSample((int(x*params.width),int(y*params.height)), self.on, color))
 			if self.on:
 				params.points_line += 1
 			else:
 				params.points_trip += 1
 		return out
 	def reverse(self):
-		return PathLine(self.end, self.start, self.on)
+		return PathLine(self.end, self.start, self.on, self.color)
 	def scp(self):
 		return self.end
 	def ecp(self):
@@ -130,7 +131,7 @@ class PathBezier3(object):
 		self.start = func(self.start)
 		self.cp = func(self.cp)
 		self.end = func(self.end)
-	def render(self, params):
+	def render(self, params, color=(255, 255, 255)):
 		# just use PathBezier4, meh
 		sx,sy = self.start
 		cx,cy = self.cp
@@ -140,7 +141,7 @@ class PathBezier3(object):
 		c1y = (1.0/3) * cy + (2.0/3) * sy
 		c2x = (1.0/3) * cx + (2.0/3) * ex
 		c2y = (1.0/3) * cy + (2.0/3) * ey
-		return PathBezier4(self.start, (c1x,c1y), (c2x,c2y), self.end).render()
+		return PathBezier4(self.start, (c1x,c1y), (c2x,c2y), self.end).render(params, color=color)
 	def reverse(self):
 		return PathBezier3(self.end, self.cp, self.start)
 	def scp(self):
@@ -164,7 +165,7 @@ class PathBezier4(object):
 		self.cp2 = func(self.cp2)
 		self.end = func(self.end)
 
-	def render(self, params):
+	def render(self, params, color):
 		x0,y0 = self.start
 		x1,y1 = self.cp1
 		x2,y2 = self.cp2
@@ -204,10 +205,10 @@ class PathBezier4(object):
 			ym = (ay2 + by1) * 0.5
 			curve1 = PathBezier4((x0,y0),(ax1,ay1),(ax2,ay2),(xm,ym))
 			curve2 = PathBezier4((xm,ym),(bx1,by1),(bx2,by2),(x3,y3))
-			return curve1.render(params) + curve2.render(params)
+			return curve1.render(params, color=color) + curve2.render(params, color=color)
 		else:
 			params.points_bezier += 1
-			return [LaserSample((int(x3*params.width),int(y3*params.height)))]
+			return [LaserSample((int(x3*params.width),int(y3*params.height)), color=color)]
 	def reverse(self):
 		return PathBezier4(self.end, self.cp2, self.cp1, self.start)
 	def scp(self):
@@ -235,20 +236,20 @@ class LaserPath(object):
 	def transform(self, func):
 		for i in self.segments:
 			i.transform(func)
-	def render(self, params):
+	def render(self, params, color=(255, 255, 255)):
 		is_closed = self.segments[0].start == self.segments[-1].end
 		sx,sy = self.segments[0].start
 		out = []
 		if is_closed:
-			out += [LaserSample((int(sx*params.width),int(sy*params.height)))] * params.closed_start_dwell
+			out += [LaserSample((int(sx*params.width),int(sy*params.height)), color=color)] * params.closed_start_dwell
 		else:
-			out += [LaserSample((int(sx*params.width),int(sy*params.height)))] * params.start_dwell
+			out += [LaserSample((int(sx*params.width),int(sy*params.height)), color=color)] * params.start_dwell
 		params.points_dwell_start += params.start_dwell
 		for i,s in enumerate(self.segments):
 			params.subpaths += 1
-			out += s.render(params)
+			out += s.render(params, color=color)
 			ex,ey = s.end
-			end_render = [LaserSample((int(ex*params.width),int(ey*params.height)))]
+			end_render = [LaserSample((int(ex*params.width),int(ey*params.height)), color=color)]
 			if i != len(self.segments)-1:
 				ecx,ecy = s.ecp()
 				sx,sy = self.segments[i+1].start
@@ -298,22 +299,28 @@ class LaserFrame(object):
 	def __init__(self):
 		self.objects = []
 	def add(self, obj):
-		self.objects.append(obj)
+		if isinstance(obj, tuple):
+			self.objects.append(obj)
+		else:
+			self.objects.append((obj, (255, 255, 255)))
 	def transform(self, func):
 		for i in self.objects:
-			i.transform(func)
+			if isinstance(i, tuple):
+				i[0].transform(func)
+			else:
+				i.transform(func)
 	def render(self, params):
 		if not self.objects:
 			return []
 		out = []
-		for n,i in enumerate(self.objects):
+		for n, (i, color) in enumerate(self.objects):
 			params.objects += 1
-			out += i.render(params)
+			out += i.render(params, color=color)
 			cpos = out[-1].coord[0] / params.width, out[-1].coord[1] / params.height
-			npos = self.objects[(n+1) % len(self.objects)].startpos()
-			trip = [LaserSample((int(cpos[0]*params.width),int(cpos[1]*params.height)))] * params.switch_on_dwell
-			trip += PathLine(cpos,npos,False).render(params)
-			trip += [LaserSample((int(npos[0]*params.width),int(npos[1]*params.height)))] * params.switch_off_dwell
+			npos = self.objects[(n+1) % len(self.objects)][0].startpos()
+			trip = [LaserSample((int(cpos[0]*params.width),int(cpos[1]*params.height)), color=color)] * params.switch_on_dwell
+			trip += PathLine(cpos,npos,False,color).render(params, color=color)
+			trip += [LaserSample((int(npos[0]*params.width),int(npos[1]*params.height)), color=color)] * params.switch_off_dwell
 			params.points_dwell_switch += params.switch_on_dwell + params.switch_off_dwell
 			for s in trip:
 				s.on = False
@@ -328,7 +335,7 @@ class LaserFrame(object):
 			best = 99999
 			besti = 0
 			bestr = False
-			for i,o in enumerate(self.objects):
+			for i, (o, color) in enumerate(self.objects):
 				x,y = o.startpos()
 				d = (x-cx)**2 + (y-cy)**2
 				if d < best:
@@ -342,9 +349,9 @@ class LaserFrame(object):
 					bestr = True
 			obj = self.objects.pop(besti)
 			if bestr:
-				obj = obj.reverse()
+				obj = (obj[0].reverse(), obj[1])
 			oobj.append(obj)
-			cx,cy = obj.endpos()
+			cx,cy = obj[0].endpos()
 		self.objects = oobj
 	def showinfo(self, tr=''):
 		print(tr+'LaserFrame:')
@@ -352,9 +359,10 @@ class LaserFrame(object):
 			i.showinfo(tr+' ')
 
 class LaserSample(object):
-	def __init__(self, coord, on=True):
+	def __init__(self, coord, on=True, color=(255, 255, 255)):
 		self.coord = coord
 		self.on = on
+		self.color = color
 	def __str__(self):
 		return "[%d] %d,%d"%(int(self.on),self.coord[0],self.coord[1])
 	def __repr__(self):
@@ -630,8 +638,9 @@ class SVGReader(xml.sax.handler.ContentHandler):
 		elif name == "path":
 			if 'transform' in attrs.keys():
 				self.transform(attrs['transform'])
-			if self.defsdepth == 0 and self.isvisible(attrs):
-				self.addPath(attrs['d'])
+			visible = self.isvisible(attrs)
+			if self.defsdepth == 0 and visible:
+				self.addPath(attrs['d'], color=visible)
 			if 'transform' in attrs.keys():
 				self.popmatrix()
 		elif name in ("polyline","polygon"):
@@ -766,11 +775,11 @@ class SVGReader(xml.sax.handler.ContentHandler):
 				a = args[0] / 180.0 * math.pi
 				mat = self.mmul(mat, (1,math.tan(a),0,1,0,0))
 		self.pushmatrix(mat)
-	def addPath(self, data):
+	def addPath(self, data, color=(255, 255, 255)):
 		p = SVGPath(data)
 		for path in p.subpaths:
 			path.transform(self.ts)
-			self.frame.add(path)
+			self.frame.add((path, color))
 	def addPolyline(self, data, close=False):
 		p = SVGPolyline(data, close)
 		for path in p.subpaths:
@@ -814,15 +823,36 @@ class SVGReader(xml.sax.handler.ContentHandler):
 		style = ' '.join(self.style_stack)
 		if 'style' in attrs.keys():
 			style += " %s"%attrs['style']
+
+		if re.match(r'display:\s*none', style):
+			return False
+
+		if 'stroke:' in style:
+			color = style.split("stroke:")[1].split(";")[0]
+			if color[0].startswith("#") and len(color) == 7:
+				return tuple(bytes.fromhex(color[1:]))
+		if 'fill:' in style:
+			color = style.split("fill:")[1].split(";")[0]
+			if color[0].startswith("#") and len(color) == 7:
+				return tuple(bytes.fromhex(color[1:]))
+
+		if 'stroke' in attrs.keys() and attrs['stroke'] != "none":
+			if attrs['stroke'].startswith("#"):
+				return tuple(bytes.fromhex(attrs['stroke'][1:]))
+			else:
+				print(attrs['stroke'])
+			return (255, 255, 255) # TODO: other ways to define color
 		if 'fill' in attrs.keys() and attrs['fill'] != "none":
-			return True
+			if attrs['fill'].startswith("#"):
+				return tuple(bytes.fromhex(attrs['fill'][1:]))
+			else:
+				print(attrs['fill'])
+			return (255, 255, 255) # TODO: other ways to define color
 		style = re.sub(r'fill:\s*none\s*(;?)','', style)
 		style = re.sub(r'stroke:\s*none\s*(;?)','', style)
 		if 'stroke' not in style and re.match(r'fill:\s*none\s',style):
 			return False
-		if re.match(r'display:\s*none', style):
-			return False
-		return True
+		return (255, 255, 255)
 
 def load_svg(path):
 	handler = SVGReader()
@@ -832,7 +862,7 @@ def load_svg(path):
 	parser.parse(path)
 	return handler.frame
 
-def write_ild(params, rframe, path, center=True):
+def write_ild(params, rframe, path, center=True, nocolor=False):
 	min_x = min_y = max_x = max_y = None
 	for i,sample in enumerate(rframe):
 		x,y = sample.coord
@@ -880,6 +910,7 @@ def write_ild(params, rframe, path, center=True):
 	samples = len(rframe)
 
 	dout = b""
+
 	for i,sample in enumerate(rframe):
 		x,y = sample.coord
 		x += offx
@@ -901,7 +932,15 @@ def write_ild(params, rframe, path, center=True):
 			raise ValueError("X out of bounds: %d"%x)
 		if abs(y) > 32767:
 			raise ValueError("Y out of bounds: %d"%y)
-		dout += struct.pack(">hhBB",x,-y,mode,0x01 if sample.on else 0x00)
+
+		if nocolor:
+			r, g, b = 0xff, 0xff, 0xff
+		else:
+			r = sample.color[0]
+			g = sample.color[1]
+			b = sample.color[2]
+
+		dout += struct.pack(">hhBBBB",x,-y,mode,b,g,r)
 
 	frame_time = samples / float(params.rate)
 
@@ -910,7 +949,7 @@ def write_ild(params, rframe, path, center=True):
 		frames = int(params.time / frame_time)
 
 	for i in range(frames):
-		hdr = struct.pack(">4s3xB8s8sHHHBx", b"ILDA", 1, b"svg2ilda", b"", samples, i, frames, 0)
+		hdr = struct.pack(">4s3xB8s8sHHHBx", b"ILDA", 5, b"svg2ilda", b"", samples, i, frames, 0)
 		fout.write(hdr)
 		fout.write(dout)
 	hdr = struct.pack(">4s3xB8s8sHHHBx", b"ILDA", 0, b"svg2ilda", b"", 0, 0, frames, 0)
@@ -921,7 +960,12 @@ if __name__ == "__main__":
 	optimize = True
 	verbose = True
 	center = True
+	nocolor = False
 	params = RenderParameters()
+
+	if sys.argv[1] == "-nocolor":
+		nocolor = True
+		sys.argv = [sys.argv[0]] + sys.argv[2:]
 
 	if sys.argv[1] == "-q":
 		verbose = False
@@ -954,7 +998,7 @@ if __name__ == "__main__":
 	if verbose:
 		print("Done")
 
-	write_ild(params, rframe, sys.argv[2], center)
+	write_ild(params, rframe, sys.argv[2], center, nocolor)
 
 	if verbose:
 		print("Statistics:")
