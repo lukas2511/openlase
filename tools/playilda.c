@@ -72,7 +72,7 @@ jack_port_t *out_w;
 nframes_t rate;
 nframes_t divider = 1;
 
-nframes_t pointrate = 30000;
+nframes_t pointrate = 20000;
 
 int scale = 0;
 
@@ -113,6 +113,15 @@ struct icoord2d {
 	uint8_t color;
 } __attribute__((packed));
 
+struct icoord2dtc {
+	int16_t x;
+	int16_t y;
+	uint8_t state;
+	uint8_t blue;
+	uint8_t green;
+	uint8_t red;
+} __attribute__((packed));
+
 struct coord3d {
 	int16_t x;
 	int16_t y;
@@ -123,12 +132,11 @@ struct coord3d {
 
 struct frame {
 	struct coord3d *points;
-	int position;
-	int count;
+	unsigned int position;
+	unsigned int count;
 };
 
-#define FRAMEBUFS 10
-struct frame frames[FRAMEBUFS];
+struct frame *frames;
 
 struct frame * volatile curframe;
 struct frame *curdframe;
@@ -216,6 +224,8 @@ int process (nframes_t nframes, void *arg)
 
 	nframes_t frm;
 	for (frm = 0; frm < nframes; frm++) {
+    //printf("fnord: %p\n", frame);
+    //printf("foobar: %d\n", frm);
 		struct coord3d *c = &frame->points[frame->position];
 		*o_x++ = (c->x / 32768.0) * size;
 		*o_y++ = (c->y / 32768.0) * size;
@@ -236,14 +246,14 @@ int process (nframes_t nframes, void *arg)
 		subpos++;
 		if (subpos == divider) {
 			subpos = 0;
-			if (c->state & LAST)
+ 		  if (c->state & LAST) {
 				frame->position = 0;
-			else
+      } else {
 				frame->position = (frame->position + 1) % frame->count;
+      }
 		}
 		if (frame->position == 0) {
 			if(curdframe != curframe) {
-				printf("Frame update\n");
 				curdframe = curframe;
 			}
 		}
@@ -283,7 +293,8 @@ int clamp(int v)
 	return v;
 }
 
-int loadild(const char *fname, struct frame *frame)
+int total_frames = 0;
+int loadild(const char *fname)
 {
 	int i;
 	FILE *ild = fopen(fname, "rb");
@@ -292,17 +303,50 @@ int loadild(const char *fname, struct frame *frame)
 	int miny = 65536, maxy = -65536;
 	int minz = 65536, maxz = -65536;
 
+	struct ilda_hdr hdr;
+
+  // looking for size
+  while(1) {
+		if (fread(&hdr, sizeof(hdr), 1, ild) != 1) {
+			fprintf(stderr, "error while reading file\n");
+			fclose(ild);
+			return -1;
+		}
+
+		if (hdr.magic != MAGIC) {
+			fprintf(stderr, "Invalid magic 0x%08x\n", hdr.magic);
+			fclose(ild);
+			return -1;
+		}
+
+		hdr.count = swapshort(hdr.count);
+		hdr.frameno = swapshort(hdr.frameno);
+		hdr.framecount = swapshort(hdr.framecount);
+
+    if (hdr.format == 2) {
+			printf("Got color palette section, %d entries\n", hdr.count);
+			fread(palette, 3, hdr.count, ild);
+    } else {
+      total_frames = hdr.framecount;
+      break;
+    }
+  }
+  frames = malloc(sizeof(struct frame) * (total_frames+1));
+  printf("framecount: %d\n", total_frames);
+  fseek(ild, 0, SEEK_SET);
+
 	if (!ild) {
 		fprintf(stderr, "cannot open %s\n", fname);
 		return -1;
 	}
 
-	frame->count = 0;
-	memset(frame, 0, sizeof(struct frame));
+	int frame_count = 0;
 
-	while(!frame->count) {
+	while(1) {
+    struct frame *frame = &frames[frame_count]; // = malloc(sizeof(struct frame));
+  	memset(frame, 0, sizeof(struct frame));
 
-		struct ilda_hdr hdr;
+    printf("looking for frame\n");
 
 		if (fread(&hdr, sizeof(hdr), 1, ild) != 1) {
 			fprintf(stderr, "error while reading file\n");
@@ -319,6 +363,13 @@ int loadild(const char *fname, struct frame *frame)
 		hdr.count = swapshort(hdr.count);
 		hdr.frameno = swapshort(hdr.frameno);
 		hdr.framecount = swapshort(hdr.framecount);
+
+    if (hdr.frameno != frame_count) {
+      printf("Breaking loop as continuous frame number doesn't match up\n");
+      frame_count-=1;
+      break;
+    }
+    printf("%d / %d\n", hdr.frameno, hdr.framecount);
 
 		switch (hdr.format) {
 		case 0:
@@ -369,91 +420,125 @@ int loadild(const char *fname, struct frame *frame)
 				return -1;
 			}
 			break;
-		}
-	}
+    case 3:
+    case 4:
+    case 6:
+      printf("Unknown packet format: %d\n", hdr.format);
+      return -1;
+      break;
+		case 5:
+			printf("Got 2D true-color frame, %d points\n", hdr.count);
+			frame->points = malloc(sizeof(struct coord3d) * hdr.count);
+			struct icoord2dtc *tmp2dtc = malloc(sizeof(struct icoord2dtc) * hdr.count);
+			if (fread(tmp2dtc, sizeof(struct icoord2dtc), hdr.count, ild) != hdr.count) {
+				fprintf(stderr, "error while reading frame\n");
+				fclose(ild);
+				free(tmp2dtc);
+				return -1;
+			}
+			for(i=0; i<hdr.count; i++) {
+				frame->points[i].x = swapshort(tmp2dtc[i].x);
+				frame->points[i].y = swapshort(tmp2dtc[i].y);
+				frame->points[i].z = 0;
+				frame->points[i].state = tmp2dtc[i].state;
+				frame->points[i].color.b = tmp2dtc[i].blue;
+				frame->points[i].color.r = tmp2dtc[i].red;
+				frame->points[i].color.g = tmp2dtc[i].green;
+			}
+			free(tmp2dtc);
+			frame->count = hdr.count;
+			break;
+    }
 
+    if (scale) {
+      for(i=0; i<frame->count; i++) {
+        if(frame->points[i].x > maxx)
+          maxx = frame->points[i].x;
+        if(frame->points[i].y > maxy)
+          maxy = frame->points[i].y;
+        if(frame->points[i].z > maxz)
+          maxz = frame->points[i].z;
+        if(frame->points[i].x < minx)
+          minx = frame->points[i].x;
+        if(frame->points[i].y < miny)
+          miny = frame->points[i].y;
+        if(frame->points[i].z < minz)
+          minz = frame->points[i].z;
+      }
+
+      int dx, dy, dz, dmax;
+      int cx, cy, cz;
+      dx = maxx-minx;
+      dy = maxy-miny;
+      dz = maxz-minz;
+      cx = (minx+maxx)/2;
+      cy = (miny+maxy)/2;
+      cz = (minz+maxz)/2;
+
+      dmax = dx;
+      if (dy > dmax)
+        dmax = dy;
+      if (dz > dmax)
+        dmax = dz;
+
+      printf("X range: %d .. %d (%d) (c:%d)\n", minx, maxx, dx, cx);
+      printf("Y range: %d .. %d (%d) (c:%d)\n", miny, maxy, dy, cy);
+      printf("Z range: %d .. %d (%d) (c:%d)\n", minz, maxz, dz, cz);
+
+      printf("Scaling by %d\n", dmax);
+
+      for(i=0; i<frame->count; i++) {
+        frame->points[i].x -= cx;
+        frame->points[i].y -= cy;
+        frame->points[i].z -= cz;
+
+        frame->points[i].x = clamp((int)frame->points[i].x * 32767 / (dmax/2+1));
+        frame->points[i].y = clamp((int)frame->points[i].y * 32767 / (dmax/2+1));
+        frame->points[i].z = clamp((int)frame->points[i].z * 32767 / (dmax/2+1));
+      }
+		}
+
+    if(hdr.format != 2) {
+      printf("Resampling %d -> %d\n", pointrate, rate);
+
+      if (pointrate > rate) {
+        printf("Downsampling not implemented!\n");
+        return -1;
+      }
+
+      int ocount = frame->count * rate / pointrate;
+      struct coord3d *opoints = malloc(sizeof(struct coord3d) * ocount);
+
+      float mul = (float)frame->count / (float)ocount;
+
+      for(i=0; i<ocount; i++) {
+        float pos = i*mul;
+        int lpos = pos;
+        int rpos = pos+1;
+        if (rpos >= frame->count)
+          rpos = lpos;
+        float off = pos - lpos;
+        opoints[i].x = frame->points[lpos].x * (1-off) + frame->points[rpos].x * off;
+        opoints[i].y = frame->points[lpos].y * (1-off) + frame->points[rpos].y * off;
+        opoints[i].z = frame->points[lpos].z * (1-off) + frame->points[rpos].z * off;
+        opoints[i].color.r = frame->points[lpos].color.r * (1-off) + frame->points[rpos].color.r * off;
+        opoints[i].color.g = frame->points[lpos].color.g * (1-off) + frame->points[rpos].color.g * off;
+        opoints[i].color.b = frame->points[lpos].color.b * (1-off) + frame->points[rpos].color.b * off;
+        opoints[i].state = frame->points[lpos].state | frame->points[rpos].state;
+      }
+
+      frame->points = opoints;
+      frame->count = ocount;
+
+      if (hdr.framecount == hdr.frameno) {
+        printf("Breaking loop as frame count has been reached\n");
+        break;
+      }
+      if(frame_count == 0) curframe = curdframe = &frames[0];
+      frame_count++;
+    }
+  }
 	fclose(ild);
-
-	if (scale) {
-		for(i=0; i<frame->count; i++) {
-			if(frame->points[i].x > maxx)
-				maxx = frame->points[i].x;
-			if(frame->points[i].y > maxy)
-				maxy = frame->points[i].y;
-			if(frame->points[i].z > maxz)
-				maxz = frame->points[i].z;
-			if(frame->points[i].x < minx)
-				minx = frame->points[i].x;
-			if(frame->points[i].y < miny)
-				miny = frame->points[i].y;
-			if(frame->points[i].z < minz)
-				minz = frame->points[i].z;
-		}
-
-		int dx, dy, dz, dmax;
-		int cx, cy, cz;
-		dx = maxx-minx;
-		dy = maxy-miny;
-		dz = maxz-minz;
-		cx = (minx+maxx)/2;
-		cy = (miny+maxy)/2;
-		cz = (minz+maxz)/2;
-
-		dmax = dx;
-		if (dy > dmax)
-			dmax = dy;
-		if (dz > dmax)
-			dmax = dz;
-
-		printf("X range: %d .. %d (%d) (c:%d)\n", minx, maxx, dx, cx);
-		printf("Y range: %d .. %d (%d) (c:%d)\n", miny, maxy, dy, cy);
-		printf("Z range: %d .. %d (%d) (c:%d)\n", minz, maxz, dz, cz);
-
-		printf("Scaling by %d\n", dmax);
-
-		for(i=0; i<frame->count; i++) {
-			frame->points[i].x -= cx;
-			frame->points[i].y -= cy;
-			frame->points[i].z -= cz;
-
-			frame->points[i].x = clamp((int)frame->points[i].x * 32767 / (dmax/2+1));
-			frame->points[i].y = clamp((int)frame->points[i].y * 32767 / (dmax/2+1));
-			frame->points[i].z = clamp((int)frame->points[i].z * 32767 / (dmax/2+1));
-		}
-
-	}
-
-	printf("Resampling %d -> %d\n", pointrate, rate);
-
-	if (pointrate > rate) {
-		printf("Downsampling not implemented!\n");
-		return -1;
-	}
-
-	int ocount = frame->count * rate / pointrate;
-	struct coord3d *opoints = malloc(sizeof(struct coord3d) * ocount);
-
-	float mul = (float)frame->count / (float)ocount;
-
-	for(i=0; i<ocount; i++) {
-		float pos = i*mul;
-		int lpos = pos;
-		int rpos = pos+1;
-		if (rpos >= frame->count)
-			rpos = lpos;
-		float off = pos - lpos;
-		opoints[i].x = frame->points[lpos].x * (1-off) + frame->points[rpos].x * off;
-		opoints[i].y = frame->points[lpos].y * (1-off) + frame->points[rpos].y * off;
-		opoints[i].z = frame->points[lpos].z * (1-off) + frame->points[rpos].z * off;
-		opoints[i].color.r = frame->points[lpos].color.r * (1-off) + frame->points[rpos].color.r * off;
-		opoints[i].color.g = frame->points[lpos].color.g * (1-off) + frame->points[rpos].color.g * off;
-		opoints[i].color.b = frame->points[lpos].color.b * (1-off) + frame->points[rpos].color.b * off;
-		opoints[i].state = frame->points[lpos].state | frame->points[rpos].state;
-	}
-
-	free(frame->points);
-	frame->points = opoints;
-	frame->count = ocount;
 
 	return 0;
 }
@@ -481,10 +566,6 @@ int main (int argc, char *argv[])
 
 	fname = *argvp;
 
-	if (argc > 2) {
-		pointrate = atoi(argvp[1]);
-	}
-
 	if ((client = jack_client_open(jack_client_name, JackNullOption, &jack_status)) == 0) {
 		fprintf (stderr, "jack server not running?\n");
 		return 1;
@@ -494,7 +575,19 @@ int main (int argc, char *argv[])
 	jack_set_buffer_size_callback (client, bufsize, 0);
 	jack_set_sample_rate_callback (client, srate, 0);
 	jack_on_shutdown (client, jack_shutdown, 0);
+  int framerate = 10;
 
+	if (argc > 2) {
+		framerate = atoi(argvp[1]);
+	}
+	if (argc > 3) {
+		pointrate = atoi(argvp[2]);
+	}
+
+	if (loadild(fname))
+	{
+		return 1;
+	}
 	out_x = jack_port_register (client, "out_x", JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput, 0);
 	out_y = jack_port_register (client, "out_y", JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput, 0);
 	out_z = jack_port_register (client, "out_z", JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput, 0);
@@ -503,13 +596,6 @@ int main (int argc, char *argv[])
 	out_b = jack_port_register (client, "out_b", JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput, 0);
 	out_w = jack_port_register (client, "out_w", JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput, 0);
 
-	memset(frames, 0, sizeof(frames));
-
-	curframe = curdframe = &frames[frameno];
-	if (loadild(fname, curframe) < 0)
-	{
-		return 1;
-	}
 
 	stat(fname, &st1);
 
@@ -521,18 +607,21 @@ int main (int argc, char *argv[])
 	}
 
 	while (1) {
-		stat(fname, &st2);
-		if(st1.st_mtime != st2.st_mtime || st1.st_mtime != st2.st_mtime) {
-			frameno = (frameno+1)%FRAMEBUFS;
-			printf("Loading new frame to slot %d\n", frameno);
-			if(frames[frameno].points)
-				free(frames[frameno].points);
-			loadild(fname, &frames[frameno]);
-			printf("New frame loaded\n");
-			curframe = &frames[frameno];
-			memcpy(&st1, &st2, sizeof(st1));
-		}
-		usleep(50000);
+    usleep(1000000/framerate);
+    frameno = (frameno+1)%total_frames;
+    curframe = &frames[frameno];
+		//stat(fname, &st2);
+		//if(st1.st_mtime != st2.st_mtime || st1.st_mtime != st2.st_mtime) {
+		//	frameno = (frameno+1)%FRAMEBUFS;
+		//	printf("Loading new frame to slot %d\n", frameno);
+		//	if(frames[frameno].points)
+		//		free(frames[frameno].points);
+		//	loadild(fname);
+		//	printf("New frame loaded\n");
+		//	curframe = &frames[frameno];
+		//	memcpy(&st1, &st2, sizeof(st1));
+		//}
+		//usleep(50000);
 	}
 	jack_client_close (client);
 	exit (0);
